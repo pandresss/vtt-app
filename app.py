@@ -8,6 +8,9 @@ with speaker diarization powered by pyannote.audio.
 import os
 import sys
 import uuid
+
+# Ensure Homebrew binaries (ffmpeg, etc.) are on PATH regardless of how the app is launched
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
 import threading
 import whisper
 from flask import Flask, request, jsonify, send_file, render_template_string
@@ -54,9 +57,103 @@ app = Flask(__name__)
 
 # Config
 UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
-OUTPUT_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcripts")
+OUTPUT_FOLDER = os.path.expanduser("~/VTT Data/transcripts")
+DB_PATH = os.path.expanduser("~/VTT Data/vtt.db")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# ─── Database setup ───────────────────────────────────────────────────────────
+import sqlite3, re, json as _json
+from datetime import datetime
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS recordings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at  TEXT NOT NULL,
+                filename    TEXT,
+                duration_s  REAL,
+                company     TEXT,
+                role        TEXT,
+                interviewer TEXT,
+                round       TEXT,
+                topics      TEXT,
+                transcript  TEXT,
+                transcript_path TEXT
+            )
+        """)
+        conn.commit()
+    print("Database ready at", DB_PATH, flush=True)
+
+init_db()
+
+def extract_metadata(text):
+    """Best-effort parse of company, role, interviewer, round from transcript."""
+    meta = {"company": None, "role": None, "interviewer": None, "round": None, "topics": []}
+
+    # Interviewer name — look for intro patterns
+    m = re.search(r"I(?:'m| am) (\w+)[,.]", text[:3000], re.IGNORECASE)
+    if m:
+        meta["interviewer"] = m.group(1)
+
+    # Company name
+    for pat in [
+        r"position here (?:at|with) ([\w\s]+?)[\.,]",
+        r"(?:at|with|for) ([\w\s]+?) (?:today|here|now)",
+        r"welcome to ([\w\s]+?)[,\.]",
+    ]:
+        m = re.search(pat, text[:3000], re.IGNORECASE)
+        if m:
+            meta["company"] = m.group(1).strip()
+            break
+
+    # Role
+    for pat in [
+        r"(?:the\s+)([\w\s]+?)\s+(?:position|role|opening)",
+        r"(?:applying for|interviewing for|chat about)\s+(?:the\s+)?([\w\s]+?)\s+(?:position|role)",
+    ]:
+        m = re.search(pat, text[:3000], re.IGNORECASE)
+        if m:
+            meta["role"] = m.group(1).strip()
+            break
+
+    # Round
+    for pat in [r"(first|second|third|fourth|final)\s+(?:round|interview)", r"round\s+(\d+)"]:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            meta["round"] = m.group(1).lower()
+            break
+
+    # Topics — simple keyword scan
+    topic_keywords = ["AI", "diarization", "workflow", "automation", "CSM", "onboarding",
+                      "renewal", "churn", "upsell", "EBR", "QBR", "technical", "integration",
+                      "python", "API", "agent", "machine learning", "data", "pipeline"]
+    meta["topics"] = [k for k in topic_keywords if k.lower() in text.lower()]
+
+    return meta
+
+def save_to_db(job_id, filename, transcript_text, transcript_path, duration_s=None):
+    """Save completed transcription to DB, return record id and extracted metadata."""
+    meta = extract_metadata(transcript_text)
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        cur = conn.execute("""
+            INSERT INTO recordings
+                (created_at, filename, duration_s, company, role, interviewer, round, topics, transcript, transcript_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (now, filename, duration_s, meta["company"], meta["role"],
+              meta["interviewer"], meta["round"], _json.dumps(meta["topics"]),
+              transcript_text, transcript_path))
+        conn.commit()
+        record_id = cur.lastrowid
+    return record_id, meta
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Track transcription jobs
 jobs = {}
@@ -134,8 +231,13 @@ def transcribe_task(job_id, filepath, output_format, num_speakers):
                 # Extract audio to wav first — pyannote handles wav more reliably than mov
                 import subprocess, tempfile
                 wav_path = filepath + ".wav"
+                ffmpeg_bin = next(
+                    (p for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"]
+                     if __import__('shutil').which(p) or __import__('os').path.isfile(p)),
+                    "ffmpeg"
+                )
                 subprocess.run(
-                    ["ffmpeg", "-y", "-i", filepath, "-ar", "16000", "-ac", "1", wav_path],
+                    [ffmpeg_bin, "-y", "-i", filepath, "-ar", "16000", "-ac", "1", wav_path],
                     check=True, capture_output=True
                 )
                 print(f"[{job_id}] Audio extracted to {wav_path}, running pipeline...", flush=True)
@@ -194,10 +296,25 @@ def transcribe_task(job_id, filepath, output_format, num_speakers):
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(output_text)
 
+        # Save to database and extract metadata
+        jobs[job_id]["step"] = "Saving to database..."
+        record_id, meta = save_to_db(
+            job_id=job_id,
+            filename=os.path.basename(filepath),
+            transcript_text=output_text,
+            transcript_path=output_path,
+        )
         jobs[job_id]["status"] = "complete"
         jobs[job_id]["output_path"] = output_path
         jobs[job_id]["output_filename"] = output_filename
         jobs[job_id]["text_preview"] = preview
+        jobs[job_id]["record_id"] = record_id
+        jobs[job_id]["meta"] = meta
+        # Flag which fields need user input
+        jobs[job_id]["needs_input"] = [
+            k for k in ["company", "role", "interviewer", "round"]
+            if not meta.get(k)
+        ]
 
     except Exception as e:
         jobs[job_id]["status"] = "error"
@@ -347,6 +464,25 @@ def download(job_id):
         as_attachment=True,
         download_name=jobs[job_id]["output_filename"],
     )
+
+
+@app.route("/save-meta/<job_id>", methods=["POST"])
+def save_meta(job_id):
+    """Save user-provided metadata corrections to the DB."""
+    if job_id not in jobs:
+        return jsonify({"error": "Job not found"}), 404
+    data = request.json
+    record_id = jobs[job_id].get("record_id")
+    if not record_id:
+        return jsonify({"error": "No DB record for this job"}), 400
+    fields = {k: v for k, v in data.items() if k in ["company", "role", "interviewer", "round"]}
+    if fields:
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        with get_db() as conn:
+            conn.execute(f"UPDATE recordings SET {set_clause} WHERE id = ?",
+                         list(fields.values()) + [record_id])
+            conn.commit()
+    return jsonify({"ok": True})
 
 
 # ─── HTML Template ────────────────────────────────────────────────────────────
@@ -706,6 +842,32 @@ HTML_TEMPLATE = r"""
                 <span>Transcription complete</span>
             </div>
             <div class="result-preview" id="resultPreview"></div>
+
+            <!-- Metadata form — shown after transcription -->
+            <div id="metaForm" style="display:none; background:#161616; border:1px solid #2a2a2a; border-radius:10px; padding:1.25rem; margin-bottom:1rem;">
+                <p style="font-size:0.85rem; color:#888; margin-bottom:1rem;">📁 Saved to database — fill in any missing details:</p>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
+                    <div>
+                        <label style="font-size:0.75rem; color:#666; display:block; margin-bottom:0.25rem;">Company</label>
+                        <input id="metaCompany" type="text" placeholder="e.g. Atomi" style="width:100%; background:#1a1a1a; color:#e0e0e0; border:1px solid #333; border-radius:6px; padding:0.5rem; font-size:0.85rem;">
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem; color:#666; display:block; margin-bottom:0.25rem;">Role</label>
+                        <input id="metaRole" type="text" placeholder="e.g. Technical CSM" style="width:100%; background:#1a1a1a; color:#e0e0e0; border:1px solid #333; border-radius:6px; padding:0.5rem; font-size:0.85rem;">
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem; color:#666; display:block; margin-bottom:0.25rem;">Interviewer</label>
+                        <input id="metaInterviewer" type="text" placeholder="e.g. Jillian" style="width:100%; background:#1a1a1a; color:#e0e0e0; border:1px solid #333; border-radius:6px; padding:0.5rem; font-size:0.85rem;">
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem; color:#666; display:block; margin-bottom:0.25rem;">Round</label>
+                        <input id="metaRound" type="text" placeholder="e.g. first, second..." style="width:100%; background:#1a1a1a; color:#e0e0e0; border:1px solid #333; border-radius:6px; padding:0.5rem; font-size:0.85rem;">
+                    </div>
+                </div>
+                <button id="saveMetaBtn" class="btn" style="margin-top:0.75rem; background:#4f8ff7; padding:0.6rem;">Save details</button>
+                <span id="metaSaved" style="display:none; color:#4ade80; font-size:0.8rem; margin-left:0.75rem;">Saved ✓</span>
+            </div>
+
             <button class="btn btn-download" id="downloadBtn">Download transcript</button>
             <button class="btn btn-new" id="newBtn">Transcribe another video</button>
         </div>
@@ -835,6 +997,30 @@ HTML_TEMPLATE = r"""
             resultPreview.textContent = data.text_preview || '';
             downloadBtn.onclick = () => {
                 window.location.href = `/download/${currentJobId}`;
+            };
+
+            // Show metadata form, pre-fill anything auto-extracted
+            const meta = data.meta || {};
+            document.getElementById('metaCompany').value = meta.company || '';
+            document.getElementById('metaRole').value = meta.role || '';
+            document.getElementById('metaInterviewer').value = meta.interviewer || '';
+            document.getElementById('metaRound').value = meta.round || '';
+            document.getElementById('metaForm').style.display = 'block';
+            document.getElementById('metaSaved').style.display = 'none';
+
+            document.getElementById('saveMetaBtn').onclick = async () => {
+                const payload = {
+                    company: document.getElementById('metaCompany').value,
+                    role: document.getElementById('metaRole').value,
+                    interviewer: document.getElementById('metaInterviewer').value,
+                    round: document.getElementById('metaRound').value,
+                };
+                await fetch(`/save-meta/${currentJobId}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                document.getElementById('metaSaved').style.display = 'inline';
             };
         }
 
