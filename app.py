@@ -94,48 +94,76 @@ def init_db():
 init_db()
 
 def extract_metadata(text):
-    """Best-effort parse of company, role, interviewer, round from transcript."""
+    """Extract company, role, interviewer, round from transcript using regex."""
     meta = {"company": None, "role": None, "interviewer": None, "round": None, "topics": []}
 
-    # Interviewer name — look for intro patterns
-    m = re.search(r"I(?:'m| am) (\w+)[,.]", text[:3000], re.IGNORECASE)
-    if m:
-        meta["interviewer"] = m.group(1)
-
-    # Company name
+    # ── Interviewer name ──────────────────────────────────────────────────────
+    # "I'm Sarah", "I am Matt", "my name is Jillian", "this is Rachel"
     for pat in [
-        r"position here (?:at|with) ([\w\s]+?)[\.,]",
-        r"(?:at|with|for) ([\w\s]+?) (?:today|here|now)",
-        r"welcome to ([\w\s]+?)[,\.]",
+        r"(?:my name is|I(?:'m| am)|this is)\s+([A-Z][a-z]+)",
+        r"^SPEAKER_\w+:\s+(?:Hi|Hello)[^.]*?(?:I(?:'m| am)|my name is)\s+([A-Z][a-z]+)",
     ]:
-        m = re.search(pat, text[:3000], re.IGNORECASE)
+        m = re.search(pat, text[:4000], re.IGNORECASE | re.MULTILINE)
         if m:
-            meta["company"] = m.group(1).strip()
-            break
+            name = m.group(1).strip()
+            # Filter out common false positives
+            if name.lower() not in ("paul", "sure", "great", "good", "here", "just", "looking"):
+                meta["interviewer"] = name
+                break
 
-    # Role
+    # ── Company name ──────────────────────────────────────────────────────────
     for pat in [
-        r"(?:the\s+)([\w\s]+?)\s+(?:position|role|opening)",
-        r"(?:applying for|interviewing for|chat about)\s+(?:the\s+)?([\w\s]+?)\s+(?:position|role)",
+        r"(?:here at|at|with|from|joining)\s+([A-Z][A-Za-z0-9\s&]{1,30}?)\s+(?:today|as|and|,|\.|to)",
+        r"welcome to\s+([A-Z][A-Za-z0-9\s&]{1,30}?)[\s,\.]",
+        r"team (?:here )?at\s+([A-Z][A-Za-z0-9\s&]{1,30}?)[\s,\.]",
+        r"(?:company|organization) (?:is |called )?([A-Z][A-Za-z0-9\s&]{1,30}?)[\s,\.]",
+        r"([A-Z][A-Za-z0-9]{2,})\s+(?:is hiring|is looking|team is)",
     ]:
-        m = re.search(pat, text[:3000], re.IGNORECASE)
+        m = re.search(pat, text[:5000], re.MULTILINE)
         if m:
-            meta["role"] = m.group(1).strip()
-            break
+            company = m.group(1).strip()
+            # Filter noise
+            if company.lower() not in ("the", "our", "this", "your", "a", "an", "we", "i", "you"):
+                meta["company"] = company
+                break
 
-    # Round
-    for pat in [r"(first|second|third|fourth|final)\s+(?:round|interview)", r"round\s+(\d+)"]:
+    # ── Role ─────────────────────────────────────────────────────────────────
+    for pat in [
+        r"(?:interviewing for|applying for|chat about|discussing)\s+(?:the\s+)?([A-Za-z\s]{3,50}?)\s+(?:role|position|opening)",
+        r"(?:the\s+)?([A-Za-z\s]{3,50}?)\s+(?:role|position)\s+(?:here|at|with)",
+        r"(?:hiring|looking)\s+(?:a|an|for\s+a|for\s+an)\s+([A-Za-z\s]{3,50?}?)[\.,]",
+    ]:
+        m = re.search(pat, text[:5000], re.IGNORECASE)
+        if m:
+            role = m.group(1).strip()
+            if len(role) > 3 and role.lower() not in ("the", "this", "our", "a", "an"):
+                meta["role"] = role
+                break
+
+    # ── Round ─────────────────────────────────────────────────────────────────
+    # Look across the whole transcript since round info can appear anywhere
+    for pat in [
+        r"(first|second|third|fourth|final)\s+(?:round|interview|call|step)",
+        r"(?:round|interview)\s+(one|two|three|four|1|2|3|4)",
+        r"(pre[\s\-]?screen|phone screen|initial call|intro call|onsite|final round)",
+        r"(?:next step|moving forward|advance)[^.]{0,60}?(second|third|final|next round)",
+        r"(hiring manager|panel|technical|take-?home)",
+    ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            meta["round"] = m.group(1).lower()
+            meta["round"] = m.group(1).strip().title()
             break
 
-    # Topics — simple keyword scan
-    topic_keywords = ["AI", "diarization", "workflow", "automation", "CSM", "onboarding",
-                      "renewal", "churn", "upsell", "EBR", "QBR", "technical", "integration",
-                      "python", "API", "agent", "machine learning", "data", "pipeline"]
+    # ── Topics ────────────────────────────────────────────────────────────────
+    topic_keywords = [
+        "AI", "machine learning", "automation", "workflow", "integration", "API",
+        "CSM", "customer success", "onboarding", "renewal", "churn", "upsell",
+        "EBR", "QBR", "technical", "python", "agent", "data", "pipeline",
+        "implementation", "adoption", "stakeholder", "enterprise", "SaaS",
+    ]
     meta["topics"] = [k for k in topic_keywords if k.lower() in text.lower()]
 
+    print(f"[metadata] Extracted: {meta}", flush=True)
     return meta
 
 def save_to_db(job_id, filename, transcript_text, transcript_path, duration_s=None):
