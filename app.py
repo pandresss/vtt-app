@@ -244,7 +244,11 @@ def transcribe_task(job_id, filepath, output_format, num_speakers):
         jobs[job_id]["step"] = "Running speech-to-text..."
 
         # Step 1: Whisper transcription
-        result = whisper_model.transcribe(filepath)
+        result = whisper_model.transcribe(
+            filepath,
+            language="en",
+            condition_on_previous_text=False,
+        )
         segments = result["segments"]
 
         # Step 2: Speaker diarization (if available)
